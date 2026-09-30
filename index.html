@@ -82,7 +82,11 @@ input[type="range"] { width: 130px; accent-color: var(--accent); height: 34px; }
 .crumbs { display: flex; flex-wrap: wrap; gap: 4px 6px; align-items: center; font-family: var(--font-data); font-size: 12.5px; }
 .crumbs .sep { color: var(--muted); }
 .sun-wrap { position: relative; display: flex; justify-content: center; margin-top: 12px; }
-#sun { display: block; max-width: 100%; touch-action: manipulation; cursor: crosshair; }
+#sun { display: block; max-width: 100%; touch-action: none; cursor: grab; }
+#sun.grabbing { cursor: grabbing; }
+.lens-ctl { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 10px; font-size: 12.5px; color: var(--ink-2); }
+.lens-ctl input[type="range"] { width: 120px; height: 24px; }
+.lens-ctl output { font-family: var(--font-data); font-size: 12px; color: var(--muted); }
 .tip { position: absolute; pointer-events: none; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px; box-shadow: 0 4px 14px rgb(0 0 0 / 0.12); font-size: 12.5px; z-index: 5; max-width: 260px; }
 .tip b { font-family: var(--font-data); font-weight: 500; display: block; font-size: 13px; }
 .tip .row { display: flex; justify-content: space-between; gap: 14px; color: var(--ink-2); }
@@ -232,8 +236,14 @@ details.about p { margin: 6px 0; max-width: 90ch; }
         <canvas id="sun" tabindex="0" aria-label="Sunburst of all voicings. The centre is the bass alone; each ring outward adds one note above the top note."></canvas>
         <div class="tip" id="tip" hidden></div>
       </div>
+      <div class="lens-ctl">
+        <label class="check"><input type="checkbox" id="lensOn" checked> Lens</label>
+        <label for="lensWidth">Segment width in the lens</label>
+        <input type="range" id="lensWidth" min="6" max="40" step="1" value="16">
+        <output id="lensOut" for="lensWidth"></output>
+      </div>
       <div class="legend" id="legend"></div>
-      <p class="hint">Click a segment to select it. Double-click to zoom into its branch, and double-click the centre to zoom out. Keys: <kbd>↑</kbd> parent, <kbd>↓</kbd> first child, <kbd>←</kbd><kbd>→</kbd> siblings, <kbd>Space</kbd> play, <kbd>Z</kbd> zoom here, <kbd>Esc</kbd> zoom out.</p>
+      <p class="hint">Click a segment to select and play it. Drag inside the lens to slide the magnified voicings; drag outside it to swing the lens around. Double-click to zoom into a branch, and double-click the centre to zoom out. Keys: <kbd>↑</kbd> parent, <kbd>↓</kbd> first child, <kbd>←</kbd><kbd>→</kbd> siblings, <kbd>Space</kbd> play, <kbd>Z</kbd> zoom here, <kbd>Esc</kbd> zoom out.</p>
     </section>
 
     <aside class="card detail" id="detail" aria-label="Selected voicing">
@@ -900,10 +910,32 @@ if (typeof module !== 'undefined') module.exports = VX;
     live.push({ g: g, o: oscs });
   }
 
-  // ---------- sunburst ----------
+  // ---------- sunburst with a ring lens ----------
+  // Angles are fractions of a turn, clockwise from the top. The lens is a sector of
+  // half-width LENS_A (display) centred on lens.t0; inside it data is magnified by
+  // lens.M, outside it the rest of the circle is compressed linearly.
   var canvas = document.getElementById('sun'), ctx = canvas.getContext('2d');
-  var sb = { W: 0, css: 0, dpr: 1, map: null, base: null, r0: 0, w: 0, R: 0, rings: 0, nodeCol: new Uint32Array(N) };
+  var sb = { W: 0, css: 0, dpr: 1, map: null, base: null, r0: 0, w: 0, R: 0, rings: 0, nodeCol: new Uint32Array(N), pring: null, pt: null, pr: null };
+  var LENS_A = 0.14;
+  var lens = { on: true, t0: 0, M: 1, target: 16 };
   function inFocus(i) { return i >= st.focus && i < st.focus + T.size[st.focus]; }
+  function lensParams() { var a = LENS_A, M = lens.M, b = a / M; return { a: a, b: b, M: M, k2: (0.5 - b) / (0.5 - a) }; }
+  function updateMag() {
+    var leafPx = 2 * Math.PI * (sb.R / sb.dpr) / T.size[st.focus];
+    lens.M = lens.on ? Math.max(1, Math.min(1e5, lens.target / leafPx)) : 1;
+    if (lens.M < 1.2) lens.M = 1;
+  }
+  // data offset from the lens centre -> display offset (both in turns, periodic)
+  function toDisp(du, L) {
+    var k = Math.round(du), x = du - k, ax = Math.abs(x);
+    var d = ax <= L.b ? ax * L.M : L.a + (ax - L.b) / L.k2;
+    return k + (x < 0 ? -d : d);
+  }
+  function centreLensOn(i) {
+    var f = st.focus, S = T.size[f];
+    lens.t0 = ((i - f) + T.size[i] / 2) / S;
+    lens.t0 -= Math.floor(lens.t0);
+  }
   function layoutSun() {
     var wrap = document.getElementById('sunWrap');
     var size = Math.max(240, Math.min(wrap.clientWidth, 680));
@@ -911,36 +943,51 @@ if (typeof module !== 'undefined') module.exports = VX;
     sb.W = Math.round(size * sb.dpr);
     canvas.width = sb.W; canvas.height = sb.W;
     canvas.style.width = size + 'px'; canvas.style.height = size + 'px';
-    buildMap(); paintBase();
+    layoutPixels(); updateMag(); buildMap(); paintBase();
   }
-  function buildMap() {
-    var W = sb.W, f = st.focus, Sz = T.size[f], fd = T.depth[f], rings = 5 - fd, dpr = sb.dpr;
-    var R = W / 2 - 2 * dpr, r0 = rings ? R * 0.15 : R, w = rings ? (R - r0) / rings : 0, gap = 1.5 * dpr;
+  // Per-pixel ring index, radius and angle; depends only on size and zoom depth.
+  function layoutPixels() {
+    var W = sb.W, dpr = sb.dpr, rings = 5 - T.depth[st.focus];
+    var R = W / 2 - 10 * dpr, r0 = rings ? R * 0.15 : R, w = rings ? (R - r0) / rings : 0, gap = 1.5 * dpr;
     sb.R = R; sb.r0 = r0; sb.w = w; sb.rings = rings;
-    var map = sb.map && sb.map.length === W * W ? sb.map : new Int32Array(W * W);
-    map.fill(-1);
-    var TWO = 2 * Math.PI, depth = T.depth, parent = T.parent, size = T.size;
+    var n = W * W;
+    if (!sb.pring || sb.pring.length !== n) { sb.pring = new Int8Array(n); sb.pt = new Float32Array(n); sb.pr = new Float32Array(n); sb.map = new Int32Array(n); }
+    var TWO = 2 * Math.PI;
     for (var y = 0; y < W; y++) {
       var dy = y + 0.5 - W / 2;
       for (var x = 0; x < W; x++) {
-        var dx = x + 0.5 - W / 2, r = Math.sqrt(dx * dx + dy * dy);
-        if (r > R) continue;
-        if (r < r0 - gap / 2) { map[y * W + x] = f; continue; }
-        var rel = Math.floor((r - r0) / w) + 1;
-        if (rel > rings || rel < 1) continue;
-        if ((r - r0) - (rel - 1) * w < gap) continue;
+        var p = y * W + x, dx = x + 0.5 - W / 2, r = Math.sqrt(dx * dx + dy * dy), ring;
+        if (r > R) ring = -1;
+        else if (r < r0 - gap / 2) ring = 0;
+        else {
+          ring = Math.floor((r - r0) / w) + 1;
+          if (ring > rings || ring < 1 || (r - r0) - (ring - 1) * w < gap) ring = -1;
+        }
+        sb.pring[p] = ring; sb.pr[p] = r;
         var th = Math.atan2(dx, -dy); if (th < 0) th += TWO;
-        var u = th / TWO, idx = f + Math.floor(u * Sz);
-        if (idx >= f + Sz) idx = f + Sz - 1;
-        var target = fd + rel;
-        while (depth[idx] > target) idx = parent[idx];
-        if (depth[idx] < target) continue;
-        var a0 = (idx - f) / Sz, a1 = (idx - f + size[idx]) / Sz;
-        if ((a1 - a0) * TWO * r > 4 * dpr && Math.min(u - a0, a1 - u) * TWO * r < 0.7 * dpr) continue;
-        map[y * W + x] = idx;
+        sb.pt[p] = th / TWO;
       }
     }
-    sb.map = map;
+  }
+  function buildMap() {
+    var f = st.focus, Sz = T.size[f], fd = T.depth[f], dpr = sb.dpr, L = lensParams(), t0 = lens.t0;
+    var map = sb.map, pring = sb.pring, pt = sb.pt, pr = sb.pr, depth = T.depth, parent = T.parent, size = T.size, TWO = 2 * Math.PI;
+    for (var p = 0; p < map.length; p++) {
+      var ring = pring[p];
+      if (ring < 0) { map[p] = -1; continue; }
+      if (ring === 0) { map[p] = f; continue; }
+      var d = pt[p] - t0; d -= Math.round(d);
+      var ad = d < 0 ? -d : d, inL = ad <= L.a, uo = inL ? ad / L.M : L.b + (ad - L.a) * L.k2;
+      var u = t0 + (d < 0 ? -uo : uo); u -= Math.floor(u);
+      var idx = f + Math.floor(u * Sz);
+      if (idx >= f + Sz) idx = f + Sz - 1;
+      var target = fd + ring;
+      while (depth[idx] > target) idx = parent[idx];
+      if (depth[idx] < target) { map[p] = -1; continue; }
+      var a0 = (idx - f) / Sz, a1 = a0 + size[idx] / Sz, circ = TWO * pr[p] * (inL ? L.M : 1 / L.k2);
+      if ((a1 - a0) * circ > 4 * dpr && Math.min(u - a0, a1 - u) * circ < 0.7 * dpr) { map[p] = -1; continue; }
+      map[p] = idx;
+    }
   }
   function computeColors() {
     var dark = isDark(), surf = hex(tok('--surface') || '#ffffff');
@@ -951,17 +998,20 @@ if (typeof module !== 'undefined') module.exports = VX;
     }
   }
   function paintBase() {
-    var W = sb.W, img = ctx.createImageData(W, W), u32 = new Uint32Array(img.data.buffer), map = sb.map, col = sb.nodeCol;
-    for (var p = 0; p < map.length; p++) { var m = map[p]; if (m >= 0) u32[p] = col[m]; }
+    var W = sb.W, img = sb.base && sb.base.width === W ? sb.base : ctx.createImageData(W, W);
+    var u32 = new Uint32Array(img.data.buffer), map = sb.map, col = sb.nodeCol;
+    for (var p = 0; p < map.length; p++) { var m = map[p]; u32[p] = m >= 0 ? col[m] : 0; }
     sb.base = img;
     drawOverlay();
   }
   function arcGeom(i) {
     var f = st.focus, Sz = T.size[f], rel = T.depth[i] - T.depth[f];
-    var a0 = (i - f) / Sz * 2 * Math.PI - Math.PI / 2, a1 = (i - f + T.size[i]) / Sz * 2 * Math.PI - Math.PI / 2;
     if (rel === 0) return { center: true, r1: sb.r0 };
+    var L = lensParams(), du0 = (i - f) / Sz - lens.t0;
+    du0 -= Math.round(du0);
+    var d0 = toDisp(du0, L), d1 = toDisp(du0 + T.size[i] / Sz, L);
     var r0 = sb.r0 + (rel - 1) * sb.w, r1 = r0 + sb.w;
-    return { a0: a0, a1: a1, r0: r0 + 1.5 * sb.dpr, r1: r1 };
+    return { a0: (lens.t0 + d0) * 2 * Math.PI - Math.PI / 2, a1: (lens.t0 + d1) * 2 * Math.PI - Math.PI / 2, r0: r0 + 1.5 * sb.dpr, r1: r1 };
   }
   function tracePath(g) {
     var c = sb.W / 2;
@@ -977,10 +1027,53 @@ if (typeof module !== 'undefined') module.exports = VX;
     var am = (g.a0 + g.a1) / 2, rm = (g.r0 + g.r1) / 2;
     return { x: c + rm * Math.cos(am), y: c + rm * Math.sin(am) };
   }
+  // Name the added note on every segment the lens has made wide enough to read.
+  function drawLabels() {
+    var f = st.focus, Sz = T.size[f], fd = T.depth[f], dpr = sb.dpr, L = lensParams(), c = sb.W / 2, TWO = 2 * Math.PI;
+    var fs = 10.5 * dpr, minPx = fs * 1.25;
+    ctx.font = fs + 'px ' + tok('--font-data');
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    var maxText = sb.w - 6 * dpr;
+    for (var i = f + 1; i < f + Sz; i++) {
+      var rel = T.depth[i] - fd, du0 = (i - f) / Sz - lens.t0;
+      du0 -= Math.round(du0);
+      var d0 = toDisp(du0, L), d1 = toDisp(du0 + T.size[i] / Sz, L), rm = sb.r0 + (rel - 0.5) * sb.w;
+      if ((d1 - d0) * TWO * rm < minPx) { i += T.size[i] - 1; continue; }
+      if (!pass[i]) continue;
+      var text = noteName(T.top[i]);
+      if (ctx.measureText(text).width > maxText) continue;
+      var ang = (lens.t0 + (d0 + d1) / 2) * TWO - Math.PI / 2, col = sb.nodeCol[i];
+      var lum = 0.2126 * (col & 255) + 0.7152 * ((col >>> 8) & 255) + 0.0722 * ((col >>> 16) & 255);
+      ctx.fillStyle = lum > 150 ? '#11141b' : '#ffffff';
+      ctx.save();
+      ctx.translate(c + rm * Math.cos(ang), c + rm * Math.sin(ang));
+      ctx.rotate(Math.cos(ang) < 0 ? ang + Math.PI : ang);
+      ctx.fillText(text, 0, 0);
+      ctx.restore();
+    }
+  }
+  function drawLensRim() {
+    if (lens.M <= 1) return;
+    var c = sb.W / 2, dpr = sb.dpr, ink = tok('--ink'), surf = tok('--surface'), rr = sb.R + 4 * dpr;
+    var A0 = (lens.t0 - LENS_A) * 2 * Math.PI - Math.PI / 2, A1 = (lens.t0 + LENS_A) * 2 * Math.PI - Math.PI / 2, Am = lens.t0 * 2 * Math.PI - Math.PI / 2;
+    ctx.strokeStyle = ink; ctx.lineCap = 'round';
+    ctx.globalAlpha = 0.5; ctx.lineWidth = 2 * dpr;
+    ctx.beginPath(); ctx.arc(c, c, rr, A0, A1); ctx.stroke();
+    ctx.globalAlpha = 0.3; ctx.lineWidth = 1 * dpr;
+    [A0, A1].forEach(function (A) {
+      ctx.beginPath(); ctx.moveTo(c + sb.r0 * Math.cos(A), c + sb.r0 * Math.sin(A)); ctx.lineTo(c + rr * Math.cos(A), c + rr * Math.sin(A)); ctx.stroke();
+    });
+    ctx.globalAlpha = 1;
+    ctx.beginPath(); ctx.arc(c + rr * Math.cos(Am), c + rr * Math.sin(Am), 5 * dpr, 0, 2 * Math.PI);
+    ctx.fillStyle = ink; ctx.fill(); ctx.lineWidth = 1.5 * dpr; ctx.strokeStyle = surf; ctx.stroke();
+    ctx.lineCap = 'butt';
+  }
   function drawOverlay() {
     if (!sb.base) return;
     ctx.putImageData(sb.base, 0, 0);
-    var dpr = sb.dpr, c = sb.W / 2, ink = tok('--ink'), surf = tok('--surface');
+    var dpr = sb.dpr, ink = tok('--ink'), surf = tok('--surface');
+    drawLabels();
+    drawLensRim();
     // common voicings as diamonds
     if (st.markCommon) {
       var acc = tok('--accent');
@@ -1015,24 +1108,29 @@ if (typeof module !== 'undefined') module.exports = VX;
       tracePath(arcGeom(st.hover)); ctx.lineWidth = 1.5 * dpr; ctx.strokeStyle = ink; ctx.stroke();
     }
   }
-  function hitAt(ev) {
+  function canvasXY(ev) {
     var rect = canvas.getBoundingClientRect();
-    var x = Math.floor((ev.clientX - rect.left) * sb.W / rect.width), y = Math.floor((ev.clientY - rect.top) * sb.W / rect.height);
+    return { x: (ev.clientX - rect.left) * sb.W / rect.width, y: (ev.clientY - rect.top) * sb.W / rect.height };
+  }
+  function hitAt(ev) {
+    var q = canvasXY(ev), x = Math.floor(q.x), y = Math.floor(q.y);
     if (x < 0 || y < 0 || x >= sb.W || y >= sb.W) return -1;
     return sb.map[y * sb.W + x];
   }
+  function turnAt(ev) {
+    var q = canvasXY(ev), th = Math.atan2(q.x - sb.W / 2, -(q.y - sb.W / 2));
+    if (th < 0) th += 2 * Math.PI;
+    return th / (2 * Math.PI);
+  }
   var tip = document.getElementById('tip');
-  canvas.addEventListener('pointermove', function (ev) {
-    var i = hitAt(ev);
-    if (i !== st.hover) { st.hover = i; drawOverlay(); }
-    if (i < 0) { tip.hidden = true; return; }
+  function showTip(ev, i) {
     tip.textContent = '';
     var b = document.createElement('b'); b.textContent = label(i); tip.appendChild(b);
     var kn = knownOf(i);
     if (kn) { var kd = document.createElement('div'); kd.style.color = 'var(--accent)'; kd.textContent = '◆ ' + kn.map(function (e) { return e.name; }).join(' · '); tip.appendChild(kd); }
-    [['Roughness', FEATURES.rough.fmt(A.rough[i])], ['Periodicity', FEATURES.period.fmt(A.period[i])], [FEATURES[st.colorBy].label, FEATURES[st.colorBy].fmt(FEATURES[st.colorBy].get(i))]]
-      .filter(function (r, k, arr) { return k < 2 || (st.colorBy !== 'rough' && st.colorBy !== 'period'); })
-      .forEach(function (r) { var d = document.createElement('div'); d.className = 'row'; var s1 = document.createElement('span'); s1.textContent = r[0]; var s2 = document.createElement('span'); s2.textContent = r[1]; d.appendChild(s1); d.appendChild(s2); tip.appendChild(d); });
+    var rows = [['Roughness', FEATURES.rough.fmt(A.rough[i])], ['Periodicity', FEATURES.period.fmt(A.period[i])]];
+    if (st.colorBy !== 'rough' && st.colorBy !== 'period') rows.push([FEATURES[st.colorBy].label, FEATURES[st.colorBy].fmt(FEATURES[st.colorBy].get(i))]);
+    rows.forEach(function (r) { var d = document.createElement('div'); d.className = 'row'; var s1 = document.createElement('span'); s1.textContent = r[0]; var s2 = document.createElement('span'); s2.textContent = r[1]; d.appendChild(s1); d.appendChild(s2); tip.appendChild(d); });
     var rt = ratingOf(i);
     if (rt) { var d2 = document.createElement('div'); d2.className = 'row'; d2.textContent = rt === 2 ? 'You love this' : rt === 1 ? 'You like this' : 'You disliked this'; tip.appendChild(d2); }
     var wrap = document.getElementById('sunWrap').getBoundingClientRect();
@@ -1040,13 +1138,52 @@ if (typeof module !== 'undefined') module.exports = VX;
     var tx = ev.clientX - wrap.left + 14, ty = ev.clientY - wrap.top + 14;
     if (tx + tip.offsetWidth > wrap.width) tx = ev.clientX - wrap.left - tip.offsetWidth - 14;
     tip.style.left = Math.max(0, tx) + 'px'; tip.style.top = ty + 'px';
+  }
+  // Drag inside the lens slides the magnified voicings under the pointer;
+  // drag outside it swings the lens around. A press without movement is a click.
+  var drag = null, lensFrame = 0;
+  function scheduleLens() {
+    if (lensFrame) return;
+    lensFrame = requestAnimationFrame(function () { lensFrame = 0; buildMap(); paintBase(); });
+  }
+  canvas.addEventListener('pointerdown', function (ev) {
+    if (ev.button !== 0) return;
+    var p = turnAt(ev), d = p - lens.t0; d -= Math.round(d);
+    drag = { x: ev.clientX, y: ev.clientY, prev: p, moved: false, inLens: lens.M > 1.5 && Math.abs(d) <= LENS_A };
+    try { canvas.setPointerCapture(ev.pointerId); } catch (e) { /* ignore */ }
   });
-  canvas.addEventListener('pointerleave', function () { st.hover = -1; tip.hidden = true; drawOverlay(); });
-  canvas.addEventListener('click', function (ev) {
+  canvas.addEventListener('pointermove', function (ev) {
+    if (drag) {
+      if (!drag.moved && Math.hypot(ev.clientX - drag.x, ev.clientY - drag.y) < 5) return;
+      if (!drag.moved) { drag.moved = true; canvas.classList.add('grabbing'); tip.hidden = true; st.hover = -1; }
+      var p = turnAt(ev), dp = p - drag.prev; dp -= Math.round(dp);
+      drag.prev = p;
+      if (lens.M <= 1) return;
+      lens.t0 += drag.inLens ? -dp / (lens.M - 1) : dp;
+      lens.t0 -= Math.floor(lens.t0);
+      scheduleLens();
+      return;
+    }
     var i = hitAt(ev);
-    if (i < 0 || i === st.sel) return;
-    select(i, { play: true });
+    if (i !== st.hover) { st.hover = i; drawOverlay(); }
+    if (i < 0) { tip.hidden = true; return; }
+    showTip(ev, i);
   });
+  function endDrag(ev, cancelled) {
+    if (!drag) return;
+    var wasDrag = drag.moved;
+    drag = null;
+    canvas.classList.remove('grabbing');
+    try { canvas.releasePointerCapture(ev.pointerId); } catch (e) { /* ignore */ }
+    if (wasDrag || cancelled) return;
+    var i = hitAt(ev);
+    if (i < 0) return;
+    if (i === st.sel) play(i);
+    else select(i, { play: true, fromCanvas: true });
+  }
+  canvas.addEventListener('pointerup', function (ev) { endDrag(ev, false); });
+  canvas.addEventListener('pointercancel', function (ev) { endDrag(ev, true); });
+  canvas.addEventListener('pointerleave', function () { if (drag) return; st.hover = -1; tip.hidden = true; drawOverlay(); });
   canvas.addEventListener('dblclick', function (ev) {
     var i = hitAt(ev);
     if (i < 0) return;
@@ -1055,7 +1192,9 @@ if (typeof module !== 'undefined') module.exports = VX;
   });
   function zoomTo(i) {
     st.focus = Math.max(0, i);
-    buildMap(); paintBase(); renderCrumbs();
+    layoutPixels(); updateMag();
+    if (inFocus(st.sel) && st.sel !== st.focus) centreLensOn(st.sel); else lens.t0 = 0;
+    buildMap(); paintBase(); renderCrumbs(); if (typeof lensText === 'function') lensText();
   }
   function renderCrumbs() {
     var el = document.getElementById('crumbs'); el.textContent = '';
@@ -1455,6 +1594,7 @@ if (typeof module !== 'undefined') module.exports = VX;
     if (i === undefined || i < 0) return;
     st.sel = i;
     if (!inFocus(i)) zoomTo(0);
+    if (!opts.fromCanvas && lens.M > 1 && i !== st.focus) { centreLensOn(i); buildMap(); paintBase(); }
     renderDetail(); renderLattice(); drawOverlay();
     if (opts.play && (st.hold || document.getElementById('playOnSelect').checked)) play(i);
   }
@@ -1505,6 +1645,14 @@ if (typeof module !== 'undefined') module.exports = VX;
     var r = +b.dataset.r, mask = T.masks[st.sel];
     setRating(mask, ratingOf(st.sel) === r ? 0 : r);
   });
+  var lensOn = document.getElementById('lensOn'), lensWidth = document.getElementById('lensWidth');
+  function lensText() { document.getElementById('lensOut').textContent = lens.on ? lens.target + ' px · ×' + (lens.M >= 10 ? Math.round(lens.M) : lens.M.toFixed(1)) : 'off'; }
+  function lensChanged() {
+    lens.on = lensOn.checked; lens.target = +lensWidth.value; lensWidth.disabled = !lens.on;
+    updateMag(); if (lens.M > 1 && inFocus(st.sel) && st.sel !== st.focus) centreLensOn(st.sel);
+    buildMap(); paintBase(); lensText();
+  }
+  lensOn.addEventListener('change', lensChanged); lensWidth.addEventListener('input', lensChanged);
   document.getElementById('zoomHere').addEventListener('click', function () { if (T.size[st.sel] > 1) zoomTo(st.sel); });
   document.getElementById('copyRatings').addEventListener('click', function () {
     var data = JSON.stringify(rated().map(function (x) { return { notes: VX.notesOf(T.masks[x.i]), names: labelFromA(T.masks[x.i]), rating: x.r }; }), null, 1);
@@ -1572,7 +1720,7 @@ if (typeof module !== 'undefined') module.exports = VX;
   var lastW = 0;
   new ResizeObserver(function () {
     var w = document.getElementById('sunWrap').clientWidth;
-    if (Math.abs(w - lastW) > 4) { lastW = w; layoutSun(); drawPlots(); }
+    if (Math.abs(w - lastW) > 4) { lastW = w; layoutSun(); lensText(); drawPlots(); }
   }).observe(document.getElementById('sunWrap'));
 
   // start on the first example
@@ -1581,7 +1729,7 @@ if (typeof module !== 'undefined') module.exports = VX;
   st.nameBass = start.bassPc; nb.value = String(start.bassPc);
   document.getElementById('chordInput').value = EXAMPLES[0];
   st.sel = T.index.get(VX.maskOf(start.notes));
-  computePass(); computeColors(); layoutSun(); renderCrumbs(); renderLegend(); renderDetail(); renderLattice(); renderPatterns(); renderCommon();
+  computePass(); computeColors(); layoutSun(); centreLensOn(st.sel); buildMap(); paintBase(); lensText(); renderCrumbs(); renderLegend(); renderDetail(); renderLattice(); renderPatterns(); renderCommon();
 })();
 </script>
 </body></html>
