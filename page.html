@@ -83,6 +83,17 @@ input[type="range"] { width: 130px; accent-color: var(--accent); height: 34px; }
 .crumbs .sep { color: var(--muted); }
 .sun-wrap { position: relative; display: flex; justify-content: center; margin-top: 12px; }
 #sun { display: block; max-width: 100%; touch-action: manipulation; cursor: pointer; }
+.loupe { position: absolute; z-index: 3; border-radius: 50%; cursor: grab; touch-action: none;
+  background: color-mix(in srgb, var(--surface) 34%, transparent);
+  -webkit-backdrop-filter: blur(7px) saturate(1.2); backdrop-filter: blur(7px) saturate(1.2);
+  box-shadow: 0 14px 34px rgb(0 0 0 / 0.22), 0 2px 6px rgb(0 0 0 / 0.12), inset 0 0 0 1px rgb(255 255 255 / 0.55), 0 0 0 1px var(--line); }
+.loupe.dragging { cursor: grabbing; }
+.loupe.placing { pointer-events: none; }
+.loupe canvas { position: absolute; border-radius: 50%; cursor: pointer; background: var(--surface);
+  box-shadow: 0 0 0 1.5px rgb(255 255 255 / 0.7), 0 0 0 3px rgb(0 0 0 / 0.14), inset 0 2px 10px rgb(0 0 0 / 0.08); }
+.loupe-mag { position: absolute; left: 50%; bottom: 7%; transform: translateX(-50%); font-family: var(--font-data); font-size: 11.5px; color: var(--ink); background: color-mix(in srgb, var(--surface) 70%, transparent); border-radius: 999px; padding: 1px 7px; pointer-events: none; }
+.range-row input#magRange { width: 110px; height: 24px; }
+#magOut { font-family: var(--font-data); font-size: 12px; color: var(--ink-2); }
 
 /* column browser */
 .browser-head { display: flex; justify-content: space-between; align-items: end; gap: 12px; flex-wrap: wrap; }
@@ -250,8 +261,21 @@ details.about p { margin: 6px 0; max-width: 90ch; }
         <h2>Tree</h2>
         <nav class="crumbs" id="crumbs" aria-label="Zoom"></nav>
       </div>
+      <div class="controls" style="margin-top:10px">
+        <button class="btn small" id="loupeBtn" type="button" aria-pressed="false">Magnifier</button>
+        <span class="range-row" id="magCtl" hidden>
+          <label for="magRange" class="muted" style="font-size:12.5px">Magnification</label>
+          <input type="range" id="magRange" min="2" max="64" step="1" value="8">
+          <output id="magOut" for="magRange">×8</output>
+        </span>
+      </div>
+      <p class="hint" id="loupeHint" hidden></p>
       <div class="sun-wrap" id="sunWrap">
         <canvas id="sun" tabindex="0" aria-label="Sunburst of all voicings. The centre is the bass alone; each ring outward adds one note above the top note."></canvas>
+        <div class="loupe" id="loupe" hidden>
+          <canvas id="loupeView" aria-label="Magnified part of the circle"></canvas>
+          <span class="loupe-mag" id="loupeMag">×8</span>
+        </div>
         <div class="tip" id="tip" hidden></div>
       </div>
       <div class="legend" id="legend"></div>
@@ -599,7 +623,7 @@ const ACOUSTIC_B64 = "/*DATA*/";
     sb.W = Math.round(size * sb.dpr);
     canvas.width = sb.W; canvas.height = sb.W;
     canvas.style.width = size + 'px'; canvas.style.height = size + 'px';
-    layoutPixels(); buildMap(); paintBase();
+    layoutPixels(); if (loupe.on) layoutLoupe(); buildMap(); paintBase();
   }
   // Per-pixel ring index, radius and angle; depends only on size and zoom depth.
   function layoutPixels() {
@@ -657,87 +681,245 @@ const ACOUSTIC_B64 = "/*DATA*/";
     sb.base = img;
     drawOverlay();
   }
-  function arcGeom(i) {
+  // Geometry in main-canvas device pixels; `unit` is one output pixel in those units.
+  function arcGeom(i, unit) {
     var f = st.focus, Sz = T.size[f], rel = T.depth[i] - T.depth[f];
     if (rel === 0) return { center: true, r1: sb.r0 };
     var r0 = sb.r0 + (rel - 1) * sb.w, r1 = r0 + sb.w;
-    return { a0: (i - f) / Sz * 2 * Math.PI - Math.PI / 2, a1: (i - f + T.size[i]) / Sz * 2 * Math.PI - Math.PI / 2, r0: r0 + 1.5 * sb.dpr, r1: r1 };
+    return { a0: (i - f) / Sz * 2 * Math.PI - Math.PI / 2, a1: (i - f + T.size[i]) / Sz * 2 * Math.PI - Math.PI / 2, r0: r0 + 1.5 * unit, r1: r1 };
   }
-  function tracePath(g) {
-    var c = sb.W / 2;
-    ctx.beginPath();
-    if (g.center) { ctx.arc(c, c, g.r1, 0, 2 * Math.PI); return; }
-    ctx.arc(c, c, g.r1, g.a0, g.a1);
-    ctx.arc(c, c, g.r0, g.a1, g.a0, true);
-    ctx.closePath();
+  function tracePath(c, g) {
+    var m = sb.W / 2;
+    c.beginPath();
+    if (g.center) { c.arc(m, m, g.r1, 0, 2 * Math.PI); return; }
+    c.arc(m, m, g.r1, g.a0, g.a1);
+    c.arc(m, m, g.r0, g.a1, g.a0, true);
+    c.closePath();
   }
-  function markerPos(i) {
-    var g = arcGeom(i), c = sb.W / 2;
-    if (g.center) return { x: c, y: c };
+  function markerPos(i, unit) {
+    var g = arcGeom(i, unit), m = sb.W / 2;
+    if (g.center) return { x: m, y: m };
     var am = (g.a0 + g.a1) / 2, rm = (g.r0 + g.r1) / 2;
-    return { x: c + rm * Math.cos(am), y: c + rm * Math.sin(am) };
+    return { x: m + rm * Math.cos(am), y: m + rm * Math.sin(am) };
   }
-  // Name the added note on every segment wide enough to read (mostly after zooming in).
-  function drawLabels() {
-    var f = st.focus, Sz = T.size[f], fd = T.depth[f], dpr = sb.dpr, c = sb.W / 2, TWO = 2 * Math.PI;
-    var fs = 10.5 * dpr, minPx = fs * 1.25, maxText = sb.w - 6 * dpr;
-    ctx.font = fs + 'px ' + tok('--font-data');
-    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  // Name the added note on every segment wide enough to read. `k` is output pixels
+  // per main-canvas pixel, (ox, oy) the output origin of main-canvas point (cx, cy),
+  // and `clip` the output radius to stay inside (0 for none).
+  function drawLabels(c, k, cx, cy, ox, oy, clip, dOut) {
+    var f = st.focus, Sz = T.size[f], fd = T.depth[f], m = sb.W / 2, TWO = 2 * Math.PI;
+    var fs = 10.5 * dOut, minPx = fs * 1.25, maxText = sb.w * k - 6 * dOut;
+    c.font = fs + 'px ' + tok('--font-data');
+    c.textAlign = 'center'; c.textBaseline = 'middle';
+    var viewAng = Math.atan2(cy - m, cx - m);
     for (var i = f + 1; i < f + Sz; i++) {
-      var rel = T.depth[i] - fd, rm = sb.r0 + (rel - 0.5) * sb.w;
-      if (T.size[i] / Sz * TWO * rm < minPx) { i += T.size[i] - 1; continue; }
+      var rel = T.depth[i] - fd, rm = sb.r0 + (rel - 0.5) * sb.w, wOut = T.size[i] / Sz * TWO * rm * k;
+      if (wOut < minPx) { i += T.size[i] - 1; continue; }
       if (!pass[i]) continue;
       var text = noteName(T.top[i]);
-      if (ctx.measureText(text).width > maxText) continue;
-      var ang = (i - f + T.size[i] / 2) / Sz * TWO - Math.PI / 2, col = sb.nodeCol[i];
+      if (c.measureText(text).width > maxText) continue;
+      var a0 = (i - f) / Sz * TWO - Math.PI / 2, a1 = a0 + T.size[i] / Sz * TWO, ang = (a0 + a1) / 2;
+      if (clip && wOut > clip) {
+        // a wide arc: put the label where the view looks at it
+        var va = viewAng; while (va < a0) va += TWO; while (va > a0 + TWO) va -= TWO;
+        var pad = (minPx / k) / rm;
+        if (va <= a1) ang = Math.max(a0 + pad, Math.min(a1 - pad, va));
+      }
+      var x = ox + (m + rm * Math.cos(ang) - cx) * k, y = oy + (m + rm * Math.sin(ang) - cy) * k;
+      if (clip && Math.hypot(x - ox, y - oy) > clip - fs) continue;
+      var col = sb.nodeCol[i];
       var lum = 0.2126 * (col & 255) + 0.7152 * ((col >>> 8) & 255) + 0.0722 * ((col >>> 16) & 255);
-      ctx.fillStyle = lum > 150 ? '#11141b' : '#ffffff';
-      ctx.save();
-      ctx.translate(c + rm * Math.cos(ang), c + rm * Math.sin(ang));
-      ctx.rotate(Math.cos(ang) < 0 ? ang + Math.PI : ang);
-      ctx.fillText(text, 0, 0);
-      ctx.restore();
+      c.fillStyle = lum > 150 ? '#11141b' : '#ffffff';
+      c.save();
+      c.translate(x, y);
+      c.rotate(Math.cos(ang) < 0 ? ang + Math.PI : ang);
+      c.fillText(text, 0, 0);
+      c.restore();
     }
   }
-  function drawOverlay() {
-    if (!sb.base) return;
-    ctx.putImageData(sb.base, 0, 0);
-    var dpr = sb.dpr, ink = tok('--ink'), surf = tok('--surface');
-    drawLabels();
-    // common voicings as diamonds
+  // Common-voicing diamonds, rating dots, selection path and hover, drawn in
+  // main-canvas coordinates on context `c`; `unit` is one output pixel.
+  function drawMarks(c, unit) {
+    var ink = tok('--ink'), surf = tok('--surface');
     if (st.markCommon) {
       var acc = tok('--accent');
       KNOWN.forEach(function (es, mask) {
         var i = T.index.get(mask);
         if (i === undefined || !inFocus(i) || !pass[i]) return;
-        var p = markerPos(i), s = 3.6 * dpr;
-        ctx.beginPath(); ctx.moveTo(p.x, p.y - s); ctx.lineTo(p.x + s, p.y); ctx.lineTo(p.x, p.y + s); ctx.lineTo(p.x - s, p.y); ctx.closePath();
-        ctx.fillStyle = acc; ctx.fill(); ctx.lineWidth = 1.2 * dpr; ctx.strokeStyle = surf; ctx.stroke();
+        var q = markerPos(i, unit), s = 3.6 * unit;
+        c.beginPath(); c.moveTo(q.x, q.y - s); c.lineTo(q.x + s, q.y); c.lineTo(q.x, q.y + s); c.lineTo(q.x - s, q.y); c.closePath();
+        c.fillStyle = acc; c.fill(); c.lineWidth = 1.2 * unit; c.strokeStyle = surf; c.stroke();
       });
     }
-    // rated markers
     ratings.forEach(function (r, mask) {
       var i = T.index.get(mask);
       if (i === undefined || !inFocus(i)) return;
-      var mp = markerPos(i), x = mp.x, y = mp.y;
-      var rad = (r === 2 ? 4.5 : 3.4) * dpr;
-      ctx.beginPath(); ctx.arc(x, y, rad, 0, 2 * Math.PI);
-      if (r > 0) { ctx.fillStyle = ink; ctx.fill(); ctx.lineWidth = 1.5 * dpr; ctx.strokeStyle = surf; ctx.stroke(); }
-      else { ctx.lineWidth = 3.2 * dpr; ctx.strokeStyle = surf; ctx.stroke(); ctx.lineWidth = 1.5 * dpr; ctx.strokeStyle = ink; ctx.stroke(); }
+      var q = markerPos(i, unit), rad = (r === 2 ? 4.5 : 3.4) * unit;
+      c.beginPath(); c.arc(q.x, q.y, rad, 0, 2 * Math.PI);
+      if (r > 0) { c.fillStyle = ink; c.fill(); c.lineWidth = 1.5 * unit; c.strokeStyle = surf; c.stroke(); }
+      else { c.lineWidth = 3.2 * unit; c.strokeStyle = surf; c.stroke(); c.lineWidth = 1.5 * unit; c.strokeStyle = ink; c.stroke(); }
     });
-    // ancestors of the selection, then the selection and hover
     if (inFocus(st.sel)) {
       for (var a = T.parent[st.sel]; a >= st.focus && a >= 0; a = T.parent[a]) {
-        tracePath(arcGeom(a)); ctx.lineWidth = 1 * dpr; ctx.strokeStyle = ink; ctx.globalAlpha = 0.45; ctx.stroke(); ctx.globalAlpha = 1;
+        tracePath(c, arcGeom(a, unit)); c.lineWidth = 1 * unit; c.strokeStyle = ink; c.globalAlpha = 0.45; c.stroke(); c.globalAlpha = 1;
       }
-      tracePath(arcGeom(st.sel));
-      ctx.lineWidth = 4 * dpr; ctx.strokeStyle = surf; ctx.stroke();
-      ctx.lineWidth = 2 * dpr; ctx.strokeStyle = ink; ctx.stroke();
+      tracePath(c, arcGeom(st.sel, unit));
+      c.lineWidth = 4 * unit; c.strokeStyle = surf; c.stroke();
+      c.lineWidth = 2 * unit; c.strokeStyle = ink; c.stroke();
     }
     if (st.hover >= 0 && st.hover !== st.sel && inFocus(st.hover)) {
-      tracePath(arcGeom(st.hover)); ctx.lineWidth = 1.5 * dpr; ctx.strokeStyle = ink; ctx.stroke();
+      tracePath(c, arcGeom(st.hover, unit)); c.lineWidth = 1.5 * unit; c.strokeStyle = ink; c.stroke();
     }
   }
+  function drawOverlay() {
+    if (!sb.base) return;
+    ctx.putImageData(sb.base, 0, 0);
+    drawLabels(ctx, 1, 0, 0, 0, 0, 0, sb.dpr);
+    drawMarks(ctx, sb.dpr);
+    renderLoupe();
+  }
+
+  // ---------- magnifier ----------
+  // Re-renders the chart under it at `mag` times the scale, so segments stay sharp.
+  // Position is kept as a fraction of the circle's size so it survives resizes.
+  var loupeEl = document.getElementById('loupe'), view = document.getElementById('loupeView'), lctx = view.getContext('2d');
+  var loupe = { on: false, placing: false, x: 0.5, y: 0.5, mag: 8, img: null, D: 0, dpr: 1, rOut: 0, rIn: 0 };
+  // Which node covers main-canvas point (sx, sy) when drawn k times larger.
+  function nodeAt(sx, sy, k, dOut) {
+    var W = sb.W, dx = sx - W / 2, dy = sy - W / 2, r = Math.sqrt(dx * dx + dy * dy);
+    var gap = 1.5 * dOut / k, f = st.focus, Sz = T.size[f], fd = T.depth[f];
+    if (r > sb.R) return -1;
+    if (r < sb.r0 - gap / 2) return f;
+    var ring = Math.floor((r - sb.r0) / sb.w) + 1;
+    if (ring < 1 || ring > sb.rings || (r - sb.r0) - (ring - 1) * sb.w < gap) return -1;
+    var th = Math.atan2(dx, -dy); if (th < 0) th += 2 * Math.PI;
+    var u = th / (2 * Math.PI), idx = f + Math.floor(u * Sz);
+    if (idx >= f + Sz) idx = f + Sz - 1;
+    var target = fd + ring;
+    while (T.depth[idx] > target) idx = T.parent[idx];
+    if (T.depth[idx] < target) return -1;
+    var a0 = (idx - f) / Sz, a1 = a0 + T.size[idx] / Sz, circ = 2 * Math.PI * r * k;
+    if ((a1 - a0) * circ > 4 * dOut && Math.min(u - a0, a1 - u) * circ < 0.7 * dOut) return -1;
+    return idx;
+  }
+  function layoutLoupe() {
+    var size = sb.css;
+    loupe.rOut = Math.round(size * 0.3); loupe.rIn = Math.round(loupe.rOut * 0.66);
+    loupe.dpr = Math.min(2, window.devicePixelRatio || 1);
+    loupe.D = Math.round(2 * loupe.rIn * loupe.dpr);
+    loupeEl.style.width = loupeEl.style.height = (2 * loupe.rOut) + 'px';
+    var rim = loupe.rOut - loupe.rIn;
+    view.style.left = view.style.top = rim + 'px';
+    view.style.width = view.style.height = (2 * loupe.rIn) + 'px';
+    view.width = view.height = loupe.D;
+    loupe.img = null;
+  }
+  function placeLoupe() {
+    loupeEl.style.left = (canvas.offsetLeft + loupe.x * sb.css - loupe.rOut) + 'px';
+    loupeEl.style.top = (canvas.offsetTop + loupe.y * sb.css - loupe.rOut) + 'px';
+    document.getElementById('loupeMag').textContent = '×' + loupe.mag;
+  }
+  function loupeK() { return loupe.mag * loupe.dpr / sb.dpr; }
+  function renderLoupe() {
+    if (!loupe.on || !sb.base) return;
+    placeLoupe();
+    var D = loupe.D, dO = loupe.dpr, k = loupeK(), cx = loupe.x * sb.W, cy = loupe.y * sb.W;
+    if (!loupe.img || loupe.img.width !== D) loupe.img = lctx.createImageData(D, D);
+    var u32 = new Uint32Array(loupe.img.data.buffer), h = D / 2, col = sb.nodeCol;
+    for (var j = 0; j < D; j++) {
+      var oy = j + 0.5 - h;
+      for (var i = 0; i < D; i++) {
+        var ox = i + 0.5 - h, p = j * D + i;
+        if (ox * ox + oy * oy > h * h) { u32[p] = 0; continue; }
+        var n = nodeAt(cx + ox / k, cy + oy / k, k, dO);
+        u32[p] = n >= 0 ? col[n] : 0;
+      }
+    }
+    lctx.putImageData(loupe.img, 0, 0);
+    drawLabels(lctx, k, cx, cy, h, h, h, dO);
+    lctx.save();
+    lctx.beginPath(); lctx.arc(h, h, h, 0, 2 * Math.PI); lctx.clip();
+    lctx.translate(h, h); lctx.scale(k, k); lctx.translate(-cx, -cy);
+    drawMarks(lctx, dO / k);
+    lctx.restore();
+  }
+  function loupeHit(ev) {
+    var rect = view.getBoundingClientRect(), k = loupeK();
+    var ox = (ev.clientX - rect.left - rect.width / 2) * loupe.dpr, oy = (ev.clientY - rect.top - rect.height / 2) * loupe.dpr;
+    if (ox * ox + oy * oy > (loupe.D / 2) * (loupe.D / 2)) return -1;
+    return nodeAt(loupe.x * sb.W + ox / k, loupe.y * sb.W + oy / k, k, loupe.dpr);
+  }
+  var loupeFrame = 0;
+  function scheduleLoupe() {
+    if (loupeFrame) return;
+    loupeFrame = requestAnimationFrame(function () { loupeFrame = 0; renderLoupe(); });
+  }
+  function setLoupeFromEvent(ev) {
+    var rect = canvas.getBoundingClientRect();
+    loupe.x = Math.max(0, Math.min(1, (ev.clientX - rect.left) / rect.width));
+    loupe.y = Math.max(0, Math.min(1, (ev.clientY - rect.top) / rect.height));
+  }
+  function setMag(m) {
+    loupe.mag = Math.max(2, Math.min(64, Math.round(m)));
+    document.getElementById('magRange').value = String(loupe.mag);
+    document.getElementById('magOut').textContent = '×' + loupe.mag;
+    scheduleLoupe();
+  }
+  function setLoupeOn(on) {
+    loupe.on = on; loupe.placing = on;
+    var btn = document.getElementById('loupeBtn');
+    btn.setAttribute('aria-pressed', String(on));
+    btn.textContent = on ? 'Put magnifier away' : 'Magnifier';
+    document.getElementById('magCtl').hidden = !on;
+    loupeEl.hidden = !on;
+    loupeEl.classList.toggle('placing', on);
+    if (on) {
+      layoutLoupe();
+      if (inFocus(st.sel)) { var q = markerPos(st.sel, sb.dpr); loupe.x = q.x / sb.W; loupe.y = q.y / sb.W; }
+      renderLoupe();
+    }
+    document.getElementById('loupeHint').hidden = !on;
+    document.getElementById('loupeHint').textContent = 'Click the circle to set the magnifier down. Drag its frosted rim to move it, scroll over it to change the magnification, and click inside it to select and play.';
+  }
+  document.getElementById('sunWrap').addEventListener('pointermove', function (ev) {
+    if (!loupe.placing) return;
+    setLoupeFromEvent(ev); scheduleLoupe();
+  });
+  var rimDrag = null;
+  loupeEl.addEventListener('pointerdown', function (ev) {
+    if (loupe.placing || ev.target !== loupeEl || ev.button !== 0) return;
+    rimDrag = { x: ev.clientX, y: ev.clientY, lx: loupe.x, ly: loupe.y };
+    loupeEl.classList.add('dragging');
+    try { loupeEl.setPointerCapture(ev.pointerId); } catch (e) { /* ignore */ }
+  });
+  loupeEl.addEventListener('pointermove', function (ev) {
+    if (!rimDrag) return;
+    loupe.x = Math.max(0, Math.min(1, rimDrag.lx + (ev.clientX - rimDrag.x) / sb.css));
+    loupe.y = Math.max(0, Math.min(1, rimDrag.ly + (ev.clientY - rimDrag.y) / sb.css));
+    scheduleLoupe();
+  });
+  function endRim(ev) { if (!rimDrag) return; rimDrag = null; loupeEl.classList.remove('dragging'); try { loupeEl.releasePointerCapture(ev.pointerId); } catch (e) { /* ignore */ } }
+  loupeEl.addEventListener('pointerup', endRim);
+  loupeEl.addEventListener('pointercancel', endRim);
+  loupeEl.addEventListener('wheel', function (ev) {
+    if (loupe.placing) return;
+    ev.preventDefault();
+    setMag(loupe.mag * Math.exp(-ev.deltaY * 0.002));
+  }, { passive: false });
+  view.addEventListener('pointermove', function (ev) {
+    if (loupe.placing || rimDrag) return;
+    var i = loupeHit(ev);
+    if (i !== st.hover) { st.hover = i; drawOverlay(); }
+    if (i < 0) { tip.hidden = true; return; }
+    showTip(ev, i);
+  });
+  view.addEventListener('pointerleave', function () { st.hover = -1; tip.hidden = true; drawOverlay(); });
+  view.addEventListener('click', function (ev) {
+    if (loupe.placing) return;
+    var i = loupeHit(ev);
+    if (i < 0) return;
+    if (i === st.sel) play(i); else select(i, { play: true });
+  });
+
   function canvasXY(ev) {
     var rect = canvas.getBoundingClientRect();
     return { x: (ev.clientX - rect.left) * sb.W / rect.width, y: (ev.clientY - rect.top) * sb.W / rect.height };
@@ -772,6 +954,10 @@ const ACOUSTIC_B64 = "/*DATA*/";
   });
   canvas.addEventListener('pointerleave', function () { st.hover = -1; tip.hidden = true; drawOverlay(); });
   canvas.addEventListener('click', function (ev) {
+    if (loupe.placing) {
+      setLoupeFromEvent(ev); loupe.placing = false; loupeEl.classList.remove('placing'); renderLoupe();
+      return;
+    }
     var i = hitAt(ev);
     if (i < 0) return;
     if (i === st.sel) play(i); else select(i, { play: true });
@@ -1301,6 +1487,8 @@ const ACOUSTIC_B64 = "/*DATA*/";
     var r = +b.dataset.r, mask = T.masks[st.sel];
     setRating(mask, ratingOf(st.sel) === r ? 0 : r);
   });
+  document.getElementById('loupeBtn').addEventListener('click', function () { setLoupeOn(!loupe.on); });
+  document.getElementById('magRange').addEventListener('input', function (e) { setMag(+e.target.value); });
   document.getElementById('zoomHere').addEventListener('click', function () { if (T.size[st.sel] > 1) zoomTo(st.sel); });
   document.getElementById('copyRatings').addEventListener('click', function () {
     var data = JSON.stringify(rated().map(function (x) { return { notes: VX.notesOf(T.masks[x.i]), names: labelFromA(T.masks[x.i]), rating: x.r }; }), null, 1);
